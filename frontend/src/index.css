@@ -1,0 +1,4 @@
+/* File: frontend/src/index.css */
+@import "tailwindcss";
+
+body { background: #f3f4f6; } /* light gray page background */

@@ -1,0 +1,112 @@
+// File: backend/src/routes/prescriptions.js
+// Doctor writes prescriptions. Patient views and downloads the PDF.
+const express = require('express');
+const PDFDocument = require('pdfkit');
+const pool = require('../config/db');
+const { authenticate, authorize, attachDoctor } = require('../middleware/auth');
+const { httpError } = require('../middleware/errorHandler');
+const { notify } = require('../services/notificationService');
+
+const router = express.Router();
+router.use(authenticate);
+
+// POST /api/prescriptions (doctor)
+router.post('/', authorize('doctor'), attachDoctor, async (req, res) => {
+  const { appointment_id, diagnosis, medicines = [], notes, follow_up_date } = req.body;
+
+  // The appointment must belong to THIS doctor
+  const a = await pool.query('SELECT * FROM appointments WHERE id = $1 AND doctor_id = $2', [appointment_id, req.doctorId]);
+  const appt = a.rows[0];
+  if (!appt) throw httpError(404, 'Appointment not found');
+  if (!appt.patient_id) throw httpError(400, 'Walk-in patients without an account cannot get a digital prescription');
+  if (!['in_progress', 'completed'].includes(appt.status)) throw httpError(400, 'Call the patient first');
+
+  // Insert, or update if a prescription already exists for this appointment
+  const r = await pool.query(
+    `INSERT INTO prescriptions (appointment_id, doctor_id, patient_id, diagnosis, medicines, notes, follow_up_date)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (appointment_id) DO UPDATE
+       SET diagnosis = EXCLUDED.diagnosis, medicines = EXCLUDED.medicines,
+           notes = EXCLUDED.notes, follow_up_date = EXCLUDED.follow_up_date
+     RETURNING *`,
+    [appointment_id, req.doctorId, appt.patient_id, diagnosis || null,
+     JSON.stringify(medicines), notes || null, follow_up_date || null]
+  );
+
+  await notify(req.app.get('io'), {
+    userId: appt.patient_id, appointmentId: appt.id, type: 'prescription',
+    title: 'Prescription ready',
+    message: 'Your prescription is ready. You can download it from the Prescriptions page.',
+  });
+  res.status(201).json(r.rows[0]);
+});
+
+// GET /api/prescriptions/my (patient)
+router.get('/my', authorize('patient'), async (req, res) => {
+  const r = await pool.query(
+    `SELECT p.*, du.name AS doctor_name, a.appointment_date
+     FROM prescriptions p
+     JOIN doctors d ON d.id = p.doctor_id
+     JOIN users du ON du.id = d.user_id
+     JOIN appointments a ON a.id = p.appointment_id
+     WHERE p.patient_id = $1 ORDER BY p.created_at DESC`,
+    [req.user.id]
+  );
+  res.json(r.rows);
+});
+
+// GET /api/prescriptions/:id/pdf : download as a PDF file
+router.get('/:id/pdf', async (req, res) => {
+  const r = await pool.query(
+    `SELECT p.*, pu.name AS patient_name, pu.phone AS patient_phone,
+            du.name AS doctor_name, d.user_id AS doctor_user_id, d.specialization, d.qualification,
+            dep.name AS department, a.appointment_date
+     FROM prescriptions p
+     JOIN users pu ON pu.id = p.patient_id
+     JOIN doctors d ON d.id = p.doctor_id
+     JOIN users du ON du.id = d.user_id
+     JOIN departments dep ON dep.id = d.department_id
+     JOIN appointments a ON a.id = p.appointment_id
+     WHERE p.id = $1`,
+    [req.params.id]
+  );
+  const p = r.rows[0];
+  if (!p) throw httpError(404, 'Prescription not found');
+
+  // Only the patient, the writing doctor, or an admin may download
+  const allowed = p.patient_id === req.user.id || p.doctor_user_id === req.user.id || req.user.role === 'admin';
+  if (!allowed) throw httpError(403, 'Not allowed');
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `attachment; filename=prescription-${p.id}.pdf`);
+
+  // Draw the PDF and stream it straight to the browser
+  const doc = new PDFDocument({ margin: 50 });
+  doc.pipe(res);
+
+  doc.fontSize(20).text('Hospital Queue Management System', { align: 'center' });
+  doc.fontSize(11).fillColor('gray').text('Prescription', { align: 'center' }).moveDown();
+  doc.fillColor('black').fontSize(12);
+  doc.text(`Doctor: ${p.doctor_name}  (${p.specialization || p.department})`);
+  if (p.qualification) doc.text(`Qualification: ${p.qualification}`);
+  doc.text(`Patient: ${p.patient_name}   Phone: ${p.patient_phone || '-'}`);
+  doc.text(`Visit date: ${p.appointment_date}`).moveDown();
+
+  doc.fontSize(14).text('Diagnosis', { underline: true });
+  doc.fontSize(12).text(p.diagnosis || '-').moveDown();
+
+  doc.fontSize(14).text('Medicines', { underline: true });
+  doc.fontSize(12);
+  (p.medicines || []).forEach((m, i) => {
+    doc.text(`${i + 1}. ${m.name} - ${m.dosage}, ${m.frequency}, for ${m.days} day(s)`);
+  });
+  doc.moveDown();
+
+  if (p.notes) { doc.fontSize(14).text('Notes', { underline: true }); doc.fontSize(12).text(p.notes).moveDown(); }
+  if (p.follow_up_date) doc.text(`Follow-up date: ${p.follow_up_date}`);
+
+  doc.moveDown(2).fontSize(9).fillColor('gray').text('Generated by HQMS. This is a computer-generated prescription.');
+  doc.end();
+});
+
+module.exports = router;
